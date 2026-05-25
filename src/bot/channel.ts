@@ -511,11 +511,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   log.info('prompt', 'built', { promptChars: prompt.length, quotes: quotes.length });
 
   const cwd = workspaces.cwdFor(scope) ?? homedir();
-  const resumeFrom = sessions.resumeFor(scope, cwd);
+  const resumeFrom = sessions.resumeFor(agent.id, scope, cwd);
   if (resumeFrom) {
     log.info('session', 'resume', { sessionId: resumeFrom, cwd });
   } else {
-    const stale = sessions.getRaw(scope);
+    const stale = sessions.getRaw(agent.id, scope);
     if (stale && stale.cwd !== cwd) {
       log.info('session', 'stale-cleared', { staleCwd: stale.cwd, newCwd: cwd });
       sessions.clear(scope);
@@ -579,7 +579,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           card: {
             initial: renderCard(initialState),
             producer: async (ctrl) => {
-              await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+              await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
                 await ctrl.update(renderCard(filterForPrefs(state)));
               });
             },
@@ -592,7 +592,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         chatId,
         {
           markdown: async (ctrl) => {
-            await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+            await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
               await ctrl.setContent(renderText(filterForPrefs(state)));
             });
           },
@@ -604,7 +604,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
       let finalState: RunState = initialState;
-      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+      await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
         finalState = state;
       });
       const body = renderText(filterForPrefs(finalState));
@@ -629,6 +629,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
  */
 async function processAgentStream(
   handle: RunHandle,
+  agentId: string,
   sessions: SessionStore,
   scope: string,
   cwd: string,
@@ -692,7 +693,7 @@ async function processAgentStream(
       if (evt.type === 'system') {
         if (evt.sessionId) {
           const effectiveCwd = evt.cwd ?? cwd;
-          sessions.set(scope, evt.sessionId, effectiveCwd);
+          sessions.set(agentId, scope, evt.sessionId, effectiveCwd);
           log.info('session', 'set', { sessionId: evt.sessionId });
         }
         continue;
