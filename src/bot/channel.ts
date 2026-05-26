@@ -45,6 +45,9 @@ import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, renderQuotedBlock, type QuotedContext } from './quote';
 import { addWorkingReaction, removeReaction } from './reaction';
+import type { AgentRole } from '../agent/role';
+import { AgentRegistry } from '../agent/registry';
+import { parseDispatch, type DispatchDirective } from '../agent/dispatch';
 
 const DEBOUNCE_MS = 600;
 
@@ -116,10 +119,11 @@ export interface StartChannelDeps {
   sessions: SessionStore;
   workspaces: WorkspaceStore;
   controls: Controls;
+  agentRegistry: AgentRegistry;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
-  const { cfg, agent, sessions, workspaces, controls } = deps;
+  const { cfg, agent, sessions, workspaces, controls, agentRegistry } = deps;
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -203,6 +207,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           controls,
           scope,
           mode,
+          agentRegistry,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -230,6 +235,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           msg,
           controls,
           chatModeCache,
+          agentRegistry,
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -248,6 +254,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           controls,
           pending,
           chatModeCache,
+          agentRegistry,
         });
       }).catch((err) => log.fail('cardAction', err));
     },
@@ -352,6 +359,7 @@ interface IntakeDeps {
   msg: NormalizedMessage;
   controls: Controls;
   chatModeCache: ChatModeCache;
+  agentRegistry: AgentRegistry;
 }
 
 async function intakeMessage(deps: IntakeDeps): Promise<void> {
@@ -365,6 +373,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     msg,
     controls,
     chatModeCache,
+    agentRegistry,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -420,6 +429,40 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  // Multi-agent routing: detect @agent-name mention in message.
+  // Routes to a specific role agent when the user @-mentions one.
+  const matchedRole = deps.agentRegistry.matchRole(msg.content);
+  if (matchedRole) {
+    const dropped = pending.cancel(scope);
+    log.info('intake', 'route-to-agent', {
+      scope,
+      target: matchedRole.id,
+      displayName: matchedRole.displayName,
+      droppedPending: dropped.length,
+    });
+    const cwd = workspaces.cwdFor(scope) ?? homedir();
+    const replyMode = getMessageReplyMode(controls.cfg);
+    await routeToAgent({
+      channel,
+      scope,
+      chatId: msg.chatId,
+      chatMode,
+      targetRole: matchedRole,
+      sourceRole: undefined,
+      roundTrip: 1,
+      sessions,
+      workspaces,
+      activeRuns,
+      controls,
+      agentRegistry,
+      promptText: msg.content,
+      cwd,
+      replyMode,
+      threadId: msg.threadId,
+    });
+    return;
+  }
+
   const handled = await tryHandleCommand({
     channel,
     msg,
@@ -430,6 +473,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     agent,
     activeRuns,
     controls,
+    agentRegistry: deps.agentRegistry,
   });
   if (handled) {
     const dropped = pending.cancel(scope);
@@ -452,6 +496,9 @@ interface RunBatchDeps {
   controls: Controls;
   scope: string;
   mode: ChatMode;
+  roleId?: string;
+  roundTrip?: number;
+  agentRegistry?: AgentRegistry;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -571,54 +618,90 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const reactionId =
     replyMode === 'card' ? undefined : await addWorkingReaction(channel, lastMsg.messageId);
 
+  let dispatchDirective: DispatchDirective | null = null;
+  let outputMessageId: string | undefined;
+
   try {
     if (replyMode === 'card') {
-      await channel.stream(
+      const result = await channel.stream(
         chatId,
         {
           card: {
             initial: renderCard(initialState),
             producer: async (ctrl) => {
-              await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-                await ctrl.update(renderCard(filterForPrefs(state)));
-              });
+              dispatchDirective = await processAgentStream(
+                handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+                  await ctrl.update(renderCard(filterForPrefs(state)));
+                },
+              );
             },
           },
         },
         sendOpts,
       );
+      outputMessageId = result.messageId;
     } else if (replyMode === 'markdown') {
-      await channel.stream(
+      const result = await channel.stream(
         chatId,
         {
           markdown: async (ctrl) => {
-            await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-              await ctrl.setContent(renderText(filterForPrefs(state)));
-            });
+            dispatchDirective = await processAgentStream(
+              handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+                await ctrl.setContent(renderText(filterForPrefs(state)));
+              },
+            );
           },
         },
         sendOpts,
       );
+      outputMessageId = result.messageId;
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
       let finalState: RunState = initialState;
-      await processAgentStream(handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-        finalState = state;
-      });
+      dispatchDirective = await processAgentStream(
+        handle, agent.id, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+          finalState = state;
+        },
+      );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
-        await channel.send(chatId, { markdown: body }, sendOpts);
+        const result = await channel.send(chatId, { markdown: body }, sendOpts);
+        outputMessageId = result.messageId;
       }
     }
   } catch (err) {
     log.fail('stream', err);
   } finally {
-    activeRuns.unregister(scope, run);
+    activeRuns.unregister(scope, run, deps.roleId);
     if (reactionId) {
       await removeReaction(channel, lastMsg.messageId, reactionId);
     }
+  }
+
+  // Handle dispatch after the run completes and cleanup is done
+  if (dispatchDirective && deps.agentRegistry) {
+    const d = dispatchDirective as DispatchDirective;
+    const sourceRole = deps.roleId;
+    log.info('dispatch', 'agent-dispatch', {
+      target: d.targetRole,
+      round: d.round,
+      sourceRole,
+    });
+    await handleDispatch(d, sourceRole, {
+      channel,
+      sessions,
+      workspaces,
+      activeRuns,
+      scope,
+      chatId,
+      chatMode: mode,
+      controls,
+      agentRegistry: deps.agentRegistry,
+      threadId: threadId ?? undefined,
+      outputMessageId,
+    });
   }
 }
 
@@ -635,8 +718,9 @@ async function processAgentStream(
   cwd: string,
   idleTimeoutMs: number | undefined,
   flush: (state: RunState) => Promise<void>,
-): Promise<void> {
+): Promise<DispatchDirective | null> {
   let state: RunState = initialState;
+  let fullText = '';
 
   // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.
@@ -705,6 +789,10 @@ async function processAgentStream(
         continue;
       }
 
+      if (evt.type === 'text') {
+        fullText += evt.delta;
+      }
+
       const prevTerminal = state.terminal;
       const prevFooter = state.footer;
       state = reduce(state, evt);
@@ -751,6 +839,15 @@ async function processAgentStream(
       await handle.run.stop();
     }
   }
+
+  if (state.terminal === 'done') {
+    const directive = parseDispatch(fullText);
+    if (directive) {
+      directive.sourceContext = fullText;
+    }
+    return directive;
+  }
+  return null;
 }
 
 /**
@@ -760,6 +857,197 @@ async function processAgentStream(
  * a stall (the card has already rendered terminal state by this point).
  */
 const POST_DONE_EXIT_GRACE_MS = 2000;
+
+interface RouteToAgentDeps {
+  channel: LarkChannel;
+  scope: string;
+  chatId: string;
+  chatMode: ChatMode;
+  targetRole: AgentRole;
+  sourceRole: string | undefined;
+  roundTrip: number;
+  sessions: SessionStore;
+  workspaces: WorkspaceStore;
+  activeRuns: ActiveRuns;
+  controls: Controls;
+  agentRegistry: AgentRegistry;
+  promptText: string;
+  cwd: string;
+  replyMode: import('../config/schema').MessageReplyMode;
+  threadId?: string;
+}
+
+interface HandleDispatchDeps {
+  channel: LarkChannel;
+  sessions: SessionStore;
+  workspaces: WorkspaceStore;
+  activeRuns: ActiveRuns;
+  scope: string;
+  chatId: string;
+  chatMode: ChatMode;
+  controls: Controls;
+  agentRegistry: AgentRegistry;
+  threadId?: string;
+  outputMessageId?: string;
+}
+
+/**
+ * Route a message to a specific role agent. Creates a new agent run for the
+ * target role, streams the result, and checks for further dispatch directives.
+ */
+async function routeToAgent(deps: RouteToAgentDeps): Promise<void> {
+  const {
+    channel, scope, chatId, chatMode, targetRole, sourceRole, roundTrip,
+    sessions, workspaces, activeRuns, controls, agentRegistry,
+    promptText, cwd, replyMode, threadId,
+  } = deps;
+
+  const sendOpts = {
+    replyTo: undefined as string | undefined,
+    ...(chatMode === 'topic' && threadId ? { replyInThread: true } as const : {}),
+  };
+
+  const resumeFrom = sessions.resumeFor(targetRole.adapter.id, scope, cwd);
+
+  // Inject role system prompt (incl. dispatch protocol) on first message only
+  const fullPrompt = targetRole.systemPrompt && !resumeFrom
+    ? `<role_context>\n${targetRole.systemPrompt}\n</role_context>\n\n${promptText}`
+    : promptText;
+  if (resumeFrom) {
+    log.info('session', 'resume', { roleId: targetRole.id, sessionId: resumeFrom, cwd });
+  }
+
+  const run = targetRole.adapter.run({
+    prompt: fullPrompt,
+    sessionId: resumeFrom,
+    cwd,
+    stopGraceMs: getAgentStopGraceMs(controls.cfg),
+    roleId: targetRole.id,
+    roundTrip,
+  });
+
+  const handle = activeRuns.register(scope, run, targetRole.id);
+  const roleLabel = `🤖 **${targetRole.displayName}**`;
+
+  let dispatchDirective: DispatchDirective | null = null;
+  let outputMessageId: string | undefined;
+
+  try {
+    if (replyMode === 'card') {
+      const initialCard = renderCard({
+        ...initialState,
+        blocks: [{ kind: 'text', content: `${roleLabel} 已启动…`, streaming: false }],
+      });
+      const result = await channel.stream(chatId, {
+        card: {
+          initial: initialCard,
+          producer: async (ctrl) => {
+            dispatchDirective = await processAgentStream(
+              handle, targetRole.adapter.id, sessions, scope, cwd, undefined, async (state) => {
+                await ctrl.update(renderCard(state));
+              },
+            );
+          },
+        },
+      }, sendOpts);
+      outputMessageId = result.messageId;
+    } else {
+      const result = await channel.stream(chatId, {
+        markdown: async (ctrl) => {
+          await ctrl.setContent(`${roleLabel} 已启动…`);
+          dispatchDirective = await processAgentStream(
+            handle, targetRole.adapter.id, sessions, scope, cwd, undefined, async (state) => {
+              await ctrl.setContent(renderText(state));
+            },
+          );
+        },
+      }, sendOpts);
+      outputMessageId = result.messageId;
+    }
+  } catch (err) {
+    log.fail('route', err, { role: targetRole.id });
+  } finally {
+    activeRuns.unregister(scope, run, targetRole.id);
+  }
+
+  if (dispatchDirective) {
+    const d = dispatchDirective as DispatchDirective;
+    log.info('dispatch', 'agent-dispatch', {
+      target: d.targetRole,
+      round: d.round,
+      sourceRole: targetRole.id,
+    });
+    await handleDispatch(d, targetRole.id, {
+      channel, sessions, workspaces, activeRuns,
+      scope, chatId, chatMode, controls, agentRegistry, threadId,
+      outputMessageId,
+    });
+  }
+}
+
+/**
+ * Handle an agent-to-agent dispatch directive. Looks up the target role,
+ * checks round-trip limits, builds a context prompt from the dispatch info,
+ * and routes to the target agent.
+ */
+async function handleDispatch(
+  dispatch: DispatchDirective,
+  sourceRole: string | undefined,
+  deps: HandleDispatchDeps,
+): Promise<void> {
+  const { channel, sessions, workspaces, activeRuns, scope, chatId, chatMode, controls, agentRegistry, threadId, outputMessageId } = deps;
+
+  const targetRole = agentRegistry.getByMention(dispatch.targetRole);
+  if (!targetRole) return;
+
+  const maxRounds = targetRole.maxRoundTrip;
+  if (dispatch.round > maxRounds) {
+    log.warn('dispatch', 'max-rounds-exceeded', {
+      target: targetRole.id,
+      round: dispatch.round,
+      max: maxRounds,
+    });
+    await channel.send(chatId, {
+      markdown: `⚠️ **${targetRole.displayName}** 已重试 ${dispatch.round} 次仍未完成，请人工介入处理。`,
+    });
+    return;
+  }
+
+  const cwd = workspaces.cwdFor(scope) ?? homedir();
+  const roleLabel = targetRole.displayName;
+  const sourceLabel = sourceRole ? agentRegistry.get(sourceRole)?.displayName ?? sourceRole : '上级';
+
+  // Build the prompt for the target agent, including source context if available
+  const instruction = dispatch.instruction ?? '';
+  let prompt = `## 来自 ${sourceLabel} 的指示\n${instruction}`.trim();
+  if (dispatch.sourceContext) {
+    prompt += `\n\n## 来自 ${sourceLabel} 的分析上下文\n${dispatch.sourceContext}`;
+  }
+  prompt = prompt || '请继续。';
+
+  // Send dispatch notification as a reply to the source agent's output,
+  // so Feishu shows the quoted context in the message chain
+  const dispatchMsg = instruction
+    ? `🔀 **${roleLabel}** 收到来自 **${sourceLabel}** 的任务：${instruction}\n\n@${targetRole.mentionName}`
+    : `🔀 **${roleLabel}** 收到来自 **${sourceLabel}** 的任务，开始执行…\n\n@${targetRole.mentionName}`;
+
+  const dispatchSendOpts: { replyTo?: string } = {};
+  if (outputMessageId) dispatchSendOpts.replyTo = outputMessageId;
+  await channel.send(chatId, { markdown: dispatchMsg }, dispatchSendOpts);
+
+  const replyMode = getMessageReplyMode(controls.cfg);
+  await routeToAgent({
+    channel, scope, chatId, chatMode,
+    targetRole,
+    sourceRole,
+    roundTrip: dispatch.round,
+    sessions, workspaces, activeRuns, controls, agentRegistry,
+    promptText: prompt,
+    cwd,
+    replyMode,
+    threadId,
+  });
+}
 
 /**
  * For interactive-card messages the SDK flattens to text-bearing nodes or

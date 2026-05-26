@@ -89,6 +89,25 @@ export interface AppAccess {
   admins?: string[];
 }
 
+/** Per-role agent configuration for multi-agent collaboration. */
+export interface AgentRoleConfig {
+  enabled: boolean;
+  /** Display name shown in chat (e.g. '产品经理'). Falls back to built-in default. */
+  displayName?: string;
+  /** Mention name used in chat (e.g. '@PM'). Falls back to built-in default. */
+  mentionName?: string;
+  /** Role description shown in /agents and injected into system prompt. */
+  description?: string;
+  /** Adapter type to use: 'claude', 'opencode', or custom. Default 'claude'. */
+  adapter?: string;
+  /** Model override for this role. */
+  model?: string;
+  /** Additional system prompt appended for this role. */
+  systemPrompt?: string;
+  /** Maximum dispatch round-trips before requesting human intervention. Default 3. */
+  maxRoundTrip?: number;
+}
+
 export interface AppPreferences {
   /** Reply rendering mode for IM (group/p2p) messages. Default 'card'. */
   messageReply?: MessageReplyMode;
@@ -141,6 +160,15 @@ export interface AppPreferences {
    * Range 100-30000; out-of-range values fall back to default.
    */
   agentStopGraceMs?: number;
+  /** Multi-agent collaboration configuration.
+   * Keys are role IDs (e.g. 'researcher', 'pm', 'dev', 'qa', 'growth').
+   * When present, enables role-based routing via @-mentions in group chats. */
+  agentRoles?: Record<string, AgentRoleConfig>;
+  /** Agent routing mode:
+   *   - 'mention': only route when explicitly @-mentioned (default)
+   *   - 'auto': automatically match based on content keywords
+   *   - 'hybrid': prefer @-mention, fall back to auto-match */
+  agentRouting?: 'mention' | 'auto' | 'hybrid';
 }
 
 /**

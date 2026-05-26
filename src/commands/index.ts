@@ -46,6 +46,7 @@ import type { SessionStore } from '../session/store';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import type { WorkspaceStore } from '../workspace/store';
 import { createBoundChat, defaultChatName } from '../bot/group';
+import type { AgentRegistry } from '../agent/registry';
 
 export interface Controls {
   /** Restart the bridge in-process: disconnect WS, kill claude runs, reload
@@ -92,6 +93,9 @@ export interface CommandContext {
    * text command. Determines whether to update the existing card vs send a
    * new one. */
   fromCardAction?: boolean;
+  /** Multi-agent registry for role-based routing. Available when agent roles
+   * are configured. */
+  agentRegistry?: AgentRegistry;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -115,6 +119,7 @@ const handlers: Record<string, Handler> = {
   '/doctor': handleDoctor,
   '/reconnect': handleReconnect,
   '/agent': handleAgent,
+  '/agents': handleAgents,
 };
 
 /**
@@ -977,6 +982,28 @@ async function handleAgent(args: string, ctx: CommandContext): Promise<void> {
   }
 
   await reply(ctx, `❌ 未知 agent：\`${name}\`\n可用：\`/agent opencode\`、\`/agent claude\``);
+}
+
+async function handleAgents(_args: string, ctx: CommandContext): Promise<void> {
+  const reg = ctx.agentRegistry;
+  if (!reg || reg.size() === 0) {
+    await reply(ctx, '🤖 当前未配置多角色 agent。\n\n通过 \`/config\` 添加 \`agentRoles\` 配置来启用。');
+    return;
+  }
+
+  const lines: string[] = ['👥 **多角色 Agent 状态**\n'];
+  for (const role of reg.list()) {
+    const active = ctx.activeRuns.getAllActive(ctx.scope).get(role.id);
+    const status = active
+      ? active.interrupted ? '⏹ 已中断' : '⏳ 运行中'
+      : '⏸ 待命';
+    lines.push(`- **${role.displayName}** (${role.mentionName}): ${status}`);
+    if (role.description) {
+      lines.push(`  _${role.description}_`);
+    }
+  }
+  lines.push('\n用法：在群聊中 @角色名 来指定对应 agent 工作。');
+  await reply(ctx, lines.join('\n'));
 }
 
 async function handleHelp(_args: string, ctx: CommandContext): Promise<void> {

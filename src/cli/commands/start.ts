@@ -2,6 +2,7 @@ import dns from 'node:dns';
 import { createInterface } from 'node:readline';
 import pkg from '../../../package.json';
 import { ClaudeAdapter } from '../../agent/claude/adapter';
+import { OpenCodeAdapter } from '../../agent/opencode/adapter';
 import { SwappableAgent } from '../../agent/swappable';
 import { startChannel, type BridgeChannel } from '../../bot/channel';
 import { runRegistrationWizard } from '../../bot/wizard';
@@ -30,6 +31,8 @@ import {
 import { SessionStore } from '../../session/store';
 import { WorkspaceStore } from '../../workspace/store';
 import { CronStore } from '../../cron/store';
+import { AgentRegistry } from '../../agent/registry';
+import type { AgentRole } from '../../agent/role';
 
 // Prefer IPv4 — Node 20+ defaults to "verbatim" which respects whatever
 // the resolver returns first; in IPv6-broken networks (WSL2, certain VPNs,
@@ -78,13 +81,85 @@ export async function runStart(opts: StartOptions): Promise<void> {
 
   await preFlightChecks({ skipCheckLarkCli: opts.skipCheckLarkCli });
 
-  const agent = new SwappableAgent(new ClaudeAdapter());
-  if (!(await agent.isAvailable())) {
-    console.error('✗ 未找到 claude CLI。请先安装 Claude Code：');
-    console.error('  https://docs.anthropic.com/en/docs/claude-code/quickstart');
+  const openCodeAdapter = new OpenCodeAdapter();
+  if (!(await openCodeAdapter.isAvailable())) {
+    console.error('✗ 未找到 opencode CLI。请先安装 OpenCode：');
+    console.error('  https://opencode.ai');
     console.error('');
-    console.error('  也支持 OpenCode (opencode CLI)，安装后发 /agent opencode 切换。');
+    console.error('  也支持 Claude Code，安装后发 /agent claude 切换。');
     process.exit(1);
+  }
+  await openCodeAdapter.ensureServer();
+  const agent = new SwappableAgent(openCodeAdapter);
+
+  // Default role metadata. Config values override these when provided.
+  const ROLE_DEFAULTS: Record<string, { displayName: string; mentionName: string; description: string }> = {
+    researcher: { displayName: '需求挖掘', mentionName: '@researcher', description: '分析需求背景、用户场景、竞品调研，为产品决策提供依据' },
+    pm: { displayName: '产品经理', mentionName: '@pm', description: '输出 PRD、拆解任务、排优先级，定义产品功能' },
+    dev: { displayName: '资深开发', mentionName: '@dev', description: '根据需求编码实现、自测、修复 bug' },
+    qa: { displayName: '测试验收', mentionName: '@qa', description: '编写和执行测试用例、回归验证、输出测试报告' },
+    growth: { displayName: '运营增长', mentionName: '@growth', description: '输出运营策略、数据分析、增长方案' },
+  };
+
+  // Agent-to-agent dispatch protocol, injected into every role's system prompt.
+  const DISPATCH_PROTOCOL = `## 智能体协作协议
+
+你是一个协作团队中的一员。当你完成自己的工作后，如果需要其他角色继续处理，在消息末尾加上调度指令：
+
+🔀 @目标角色名 #round=<轮次数>
+
+- 轮次数从 1 开始计数，每经过一次 dispatch 加 1
+- 不超过 3 轮，超过后会自动请求人工介入
+- 可以附带简要说明，说明为什么需要这个角色
+
+例如：
+\`\`\`
+分析完成，技术方案已出。
+🔀 @Dev #round=1 请按方案编码实现
+\`\`\``;
+
+  // Build the multi-agent registry from config. If no agentRoles configured,
+  // the registry stays empty and the bridge behaves as before (single agent).
+  const agentRegistry = new AgentRegistry();
+  const roleConfigs = cfg.preferences?.agentRoles;
+  if (roleConfigs) {
+    for (const [roleId, roleCfg] of Object.entries(roleConfigs)) {
+      if (!roleCfg.enabled) continue;
+      const innerAdapter = roleCfg.adapter === 'opencode'
+        ? new OpenCodeAdapter()
+        : new ClaudeAdapter();
+      const roleAgent = new SwappableAgent(innerAdapter);
+      const defaults = ROLE_DEFAULTS[roleId];
+      const mentionOthers = Object.values(ROLE_DEFAULTS)
+        .filter((d) => d.mentionName !== (roleCfg.mentionName ?? defaults?.mentionName))
+        .map((d) => d.mentionName)
+        .join('、');
+      const rolePrompt = [
+        `你当前扮演的角色是：${roleCfg.displayName ?? defaults?.displayName ?? roleId}`,
+        roleCfg.description ?? defaults?.description ?? '',
+        `你的群聊 @ 名称：${roleCfg.mentionName ?? defaults?.mentionName ?? `@${roleId}`}`,
+        `团队中的其他角色：${mentionOthers || '无'}`,
+        '',
+        DISPATCH_PROTOCOL,
+        roleCfg.systemPrompt ?? '',
+      ].filter(Boolean).join('\n');
+      const role: AgentRole = {
+        id: roleId,
+        displayName: roleCfg.displayName ?? defaults?.displayName ?? roleId,
+        mentionName: roleCfg.mentionName ?? defaults?.mentionName ?? `@${roleId}`,
+        description: roleCfg.description ?? defaults?.description ?? '',
+        adapter: roleAgent,
+        systemPrompt: rolePrompt,
+        maxRoundTrip: roleCfg.maxRoundTrip ?? 3,
+      };
+      agentRegistry.register(role);
+    }
+    if (agentRegistry.size() > 0) {
+      console.log(`👥 已加载 ${agentRegistry.size()} 个角色 agent：`);
+      for (const r of agentRegistry.list()) {
+        console.log(`   ${r.mentionName} — ${r.displayName}`);
+      }
+    }
   }
 
   const sessions = new SessionStore();
@@ -171,6 +246,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
           sessions,
           workspaces,
           controls,
+          agentRegistry,
         });
         console.log('[restart] disconnecting old bridge...');
         try {
@@ -197,7 +273,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
     },
   };
 
-  bridge = await startChannel({ cfg, agent, sessions, workspaces, controls });
+  bridge = await startChannel({ cfg, agent, sessions, workspaces, controls, agentRegistry });
 
   // Backfill the bot's display name into the registry once WS handshake is
   // done — future starts conflicting on this app can show it in the prompt

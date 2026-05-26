@@ -8,6 +8,7 @@ import { isChatAllowed, isUserAllowed } from '../config/schema';
 import { log } from '../core/logger';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
+import type { AgentRegistry } from '../agent/registry';
 
 /** Marker key on a button's value object that flags the cardAction as
  * a callback that should be forwarded back to the agent (Claude) instead
@@ -27,6 +28,7 @@ export interface CardDispatchDeps {
   controls: Controls;
   pending: PendingQueue;
   chatModeCache: ChatModeCache;
+  agentRegistry?: AgentRegistry;
 }
 
 export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
@@ -96,6 +98,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     controls: deps.controls,
     formValue,
     fromCardAction: true,
+    agentRegistry: deps.agentRegistry,
   };
 
   const [name, ...rest] = cmd.split('.');

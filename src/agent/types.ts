@@ -22,6 +22,10 @@ export interface AgentRunOptions {
    * are adapter-specific.
    */
   stopGraceMs?: number;
+  /** Agent role identifier for multi-agent routing (e.g. 'pm', 'dev', 'qa'). */
+  roleId?: string;
+  /** Current dispatch round-trip count; used to prevent infinite dispatch loops. */
+  roundTrip?: number;
 }
 
 export interface AgentRun {
